@@ -48,6 +48,14 @@ else:
     stock_code = stock_input
     stock_name = stock_input
 
+# 成本改成選填：沒有持股也可以分析進場時機
+use_cost = st.checkbox("我要輸入持股成本", value=False)
+
+if use_cost:
+    cost = st.number_input("輸入你的成本價", min_value=0.0, value=93.0, step=1.0)
+else:
+    cost = 0.0
+
 # ===== 抓資料函式 =====
 def get_stock_data(code):
     """
@@ -647,98 +655,108 @@ def analyze_stock(df, cost):
 
 # ===== 主程式 =====
 if stock_code:
-    df, ticker_used = get_stock_data(stock_code)
+    try:
+        df, ticker_used = get_stock_data(stock_code)
 
-    if df.empty:
-        st.error("抓不到資料，請確認股票名稱或股票代號是否正確。")
-    else:
-        result = analyze_stock(df, cost)
-        latest = result.iloc[-1]
+        if df is None or df.empty:
+            st.error("抓不到資料，請確認股票名稱或股票代號是否正確。")
+        else:
+            result = analyze_stock(df, cost)
 
-        st.subheader(f"股票：{stock_name} / {stock_code}，資料來源代號：{ticker_used}")
-
-        tab1, tab2, tab3, tab4 = st.tabs(["總覽", "K線與均線", "5K與量價", "資料表"])
-
-        with tab1:
-            st.markdown("## 總覽")
-
-            col1, col2, col3, col4 = st.columns(4)
-
-            col1.metric("最新收盤價", f"{latest['Close']:.2f}")
-            col2.metric("狀態", latest["狀態"])
-            col3.metric("進場分數", f"{latest['進場分數']:.0f}")
-            col4.metric("進場評估", latest["進場評估"])
-
-            col5, col6, col7, col8 = st.columns(4)
-
-            col5.metric("MA5", f"{latest['MA5']:.2f}" if not pd.isna(latest["MA5"]) else "資料不足")
-            col6.metric("MA10", f"{latest['MA10']:.2f}" if not pd.isna(latest["MA10"]) else "資料不足")
-            col7.metric("MA20", f"{latest['MA20']:.2f}" if not pd.isna(latest["MA20"]) else "資料不足")
-
-            if cost > 0:
-                col8.metric("損益率", f"{latest['損益率']:.2f}%")
+            if result is None or result.empty:
+                st.error("分析後沒有資料，可能是股價資料不足。")
             else:
-                col8.metric("損益率", "未輸入成本")
+                latest = result.iloc[-1]
 
-            st.markdown("### 進場評估原因")
-            st.info(latest["評估原因"])
+                st.subheader(f"股票：{stock_name} / {stock_code}，資料來源代號：{ticker_used}")
 
-            st.markdown("### 持股操作提醒")
-            st.write(latest["操作提醒"])
+                tab1, tab2, tab3, tab4 = st.tabs(["總覽", "K線與均線", "5K與量價", "資料表"])
 
-            if latest["費波提醒"] != "":
-                st.warning(latest["費波提醒"])
-            else:
-                st.write("目前沒有費波轉折提醒。")
+                with tab1:
+                    st.markdown("## 總覽")
 
-            st.markdown("### 支撐與壓力")
-            st.write(f"20 日壓力：{latest['20日壓力']:.2f}" if not pd.isna(latest["20日壓力"]) else "20 日壓力：資料不足")
-            st.write(f"20 日支撐：{latest['20日支撐']:.2f}" if not pd.isna(latest["20日支撐"]) else "20 日支撐：資料不足")
+                    col1, col2, col3, col4 = st.columns(4)
 
-        with tab2:
-            st.markdown("## K線與均線")
+                    col1.metric("最新收盤價", f"{latest['Close']:.2f}")
+                    col2.metric("狀態", latest["狀態"])
+                    col3.metric("進場分數", f"{latest['進場分數']:.0f}")
+                    col4.metric("進場評估", latest["進場評估"])
 
-            st.markdown("### 最新單根 K 線型態")
-            st.success(f"{latest['K線型態']}")
-            st.write(latest["K線解讀"])
+                    col5, col6, col7, col8 = st.columns(4)
 
-            st.markdown("### 收盤價與均線")
-            chart_data = result[["Close", "MA5", "MA10", "MA20"]].dropna()
-            st.line_chart(chart_data, use_container_width=True)
+                    col5.metric("MA5", f"{latest['MA5']:.2f}" if not pd.isna(latest["MA5"]) else "資料不足")
+                    col6.metric("MA10", f"{latest['MA10']:.2f}" if not pd.isna(latest["MA10"]) else "資料不足")
+                    col7.metric("MA20", f"{latest['MA20']:.2f}" if not pd.isna(latest["MA20"]) else "資料不足")
 
-        with tab3:
-            st.markdown("## 5K 與量價")
+                    if cost > 0:
+                        col8.metric("損益率", f"{latest['損益率']:.2f}%")
+                    else:
+                        col8.metric("損益率", "未輸入成本")
 
-            st.markdown("### 最近 5 根 K 線綜合判斷")
-            st.warning(f"{latest['5K型態']}｜{latest['5K後續狀態']}")
-            st.write(latest["5K解讀"])
+                    st.markdown("### 進場評估原因")
+                    st.info(latest["評估原因"])
 
-            st.markdown("### 量價關係")
-            st.success(f"{latest['量價型態']}")
-            st.write(latest["量價解讀"])
+                    st.markdown("### 持股操作提醒")
+                    st.write(latest["操作提醒"])
 
-            st.markdown("### 成交量")
-            colv1, colv2, colv3 = st.columns(3)
-            colv1.metric("成交量", f"{latest['成交量_張']:.0f} 張")
-            colv2.metric("5日均量", f"{latest['MV5']:.0f} 張" if not pd.isna(latest["MV5"]) else "資料不足")
-            colv3.metric("20日均量", f"{latest['MV20']:.0f} 張" if not pd.isna(latest["MV20"]) else "資料不足")
+                    if latest["費波提醒"] != "":
+                        st.warning(latest["費波提醒"])
+                    else:
+                        st.write("目前沒有費波轉折提醒。")
 
-            volume_chart = result[["成交量_張", "MV5", "MV20"]].dropna()
-            st.line_chart(volume_chart, use_container_width=True)
+                    st.markdown("### 支撐與壓力")
+                    st.write(f"20 日壓力：{latest['20日壓力']:.2f}" if not pd.isna(latest["20日壓力"]) else "20 日壓力：資料不足")
+                    st.write(f"20 日支撐：{latest['20日支撐']:.2f}" if not pd.isna(latest["20日支撐"]) else "20 日支撐：資料不足")
 
-        with tab4:
-            st.markdown("## 最近 30 筆資料")
+                with tab2:
+                    st.markdown("## K線與均線")
 
-            show_cols = [
-                "Open", "High", "Low", "Close",
-                "Volume", "成交量_張", "MV5", "MV20",
-                "K線型態", "K線解讀",
-                "MA5", "MA10", "MA20",
-                "狀態", "波段方向", "波段天數", "費波提醒",
-                "5K型態", "5K後續狀態", "5K解讀",
-                "量價型態", "量價解讀",
-                "進場分數", "進場評估", "評估原因",
-                "損益率", "操作提醒"
-            ]
+                    st.markdown("### 最新單根 K 線型態")
+                    st.success(f"{latest['K線型態']}")
+                    st.write(latest["K線解讀"])
 
-            st.dataframe(result[show_cols].tail(30), use_container_width=True)
+                    st.markdown("### 收盤價與均線")
+                    chart_data = result[["Close", "MA5", "MA10", "MA20"]].dropna()
+                    st.line_chart(chart_data, use_container_width=True)
+
+                with tab3:
+                    st.markdown("## 5K 與量價")
+
+                    st.markdown("### 最近 5 根 K 線綜合判斷")
+                    st.warning(f"{latest['5K型態']}｜{latest['5K後續狀態']}")
+                    st.write(latest["5K解讀"])
+
+                    st.markdown("### 量價關係")
+                    st.success(f"{latest['量價型態']}")
+                    st.write(latest["量價解讀"])
+
+                    st.markdown("### 成交量")
+                    colv1, colv2, colv3 = st.columns(3)
+                    colv1.metric("成交量", f"{latest['成交量_張']:.0f} 張")
+                    colv2.metric("5日均量", f"{latest['MV5']:.0f} 張" if not pd.isna(latest["MV5"]) else "資料不足")
+                    colv3.metric("20日均量", f"{latest['MV20']:.0f} 張" if not pd.isna(latest["MV20"]) else "資料不足")
+
+                    volume_chart = result[["成交量_張", "MV5", "MV20"]].dropna()
+                    st.line_chart(volume_chart, use_container_width=True)
+
+                with tab4:
+                    st.markdown("## 最近 30 筆資料")
+
+                    show_cols = [
+                        "Open", "High", "Low", "Close",
+                        "Volume", "成交量_張", "MV5", "MV20",
+                        "K線型態", "K線解讀",
+                        "MA5", "MA10", "MA20",
+                        "狀態", "波段方向", "波段天數", "費波提醒",
+                        "5K型態", "5K後續狀態", "5K解讀",
+                        "量價型態", "量價解讀",
+                        "進場分數", "進場評估", "評估原因",
+                        "損益率", "操作提醒"
+                    ]
+
+                    existing_cols = [col for col in show_cols if col in result.columns]
+                    st.dataframe(result[existing_cols].tail(30), use_container_width=True)
+
+    except Exception as e:
+        st.error("程式執行時發生錯誤")
+        st.exception(e)
