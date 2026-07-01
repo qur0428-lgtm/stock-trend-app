@@ -378,73 +378,150 @@ def volume_analysis(row):
 
 # ===== 進場評分 =====
 def entry_score(row):
+    """
+    進場時機評分：
+    不是判斷股票強不強，而是判斷「現在這個位置適不適合進場」。
+
+    核心邏輯：
+    1. 趨勢不能太差
+    2. 避免追高
+    3. 偏好強勢股回檔、量縮整理、支撐承接、合理突破
+    """
+
     score = 50
     reasons = []
 
-    # 均線趨勢
-    if not pd.isna(row["MA20"]):
-        if row["Close"] > row["MA5"] > row["MA10"] > row["MA20"]:
-            score += 20
-            reasons.append("均線多頭排列")
-        elif row["Close"] > row["MA20"]:
-            score += 10
-            reasons.append("股價站上MA20")
-        else:
-            score -= 20
-            reasons.append("股價跌破MA20")
+    close = row["Close"]
 
-    # 波段方向
-    if row["波段方向"] == "推動波":
-        score += 15
-        reasons.append("MA5斜率向上，屬推動波")
-    elif row["波段方向"] == "修正波":
+    ma5 = row["MA5"]
+    ma10 = row["MA10"]
+    ma20 = row["MA20"]
+
+    # ===== 資料不足 =====
+    if pd.isna(ma20):
+        return pd.Series([0, "資料不足", "MA20資料不足，暫時不評估"])
+
+    # ===== 計算乖離 =====
+    ma5_gap = (close - ma5) / ma5 if ma5 and not pd.isna(ma5) else 0
+    ma20_gap = (close - ma20) / ma20 if ma20 and not pd.isna(ma20) else 0
+
+    # ===== 先判斷趨勢基礎 =====
+    trend_ok = False
+
+    if close > ma5 > ma10 > ma20:
+        score += 20
+        trend_ok = True
+        reasons.append("均線多頭排列")
+    elif close > ma20 and ma5 > ma10:
+        score += 10
+        trend_ok = True
+        reasons.append("股價站上MA20，短線均線偏多")
+    elif close > ma20:
+        score += 5
+        trend_ok = True
+        reasons.append("股價仍站上MA20")
+    else:
+        score -= 25
+        reasons.append("股價跌破MA20，趨勢偏弱")
+
+    # ===== 避免追高：漲太遠要扣分 =====
+    if ma5_gap > 0.06:
+        score -= 20
+        reasons.append("股價高於MA5超過6%，短線有追高風險")
+    elif ma5_gap > 0.035:
         score -= 10
-        reasons.append("MA5斜率向下，屬修正波")
+        reasons.append("股價高於MA5較多，追高需小心")
 
-    # 5K狀態
-    if row["5K後續狀態"] in ["偏多轉強", "偏多續強"]:
-        score += 15
-        reasons.append("5K結構偏多")
-    elif row["5K後續狀態"] in ["偏空轉弱", "偏空續弱"]:
+    if ma20_gap > 0.15:
+        score -= 20
+        reasons.append("股價高於MA20超過15%，波段乖離過大")
+    elif ma20_gap > 0.10:
+        score -= 10
+        reasons.append("股價高於MA20超過10%，已有一定漲幅")
+
+    # ===== 5K過熱扣分 =====
+    if row["5K後續狀態"] == "偏多但留意拉回":
         score -= 15
-        reasons.append("5K結構偏空")
-    elif row["5K後續狀態"] == "偏多但留意拉回":
-        score += 5
-        reasons.append("5K短線強勢但過熱")
-    elif row["5K後續狀態"] == "止跌觀察":
-        score += 5
-        reasons.append("5K出現下影承接")
+        reasons.append("5K急漲過熱，不適合追高")
 
-    # 量價
-    if row["量價型態"] == "價漲量增":
-        score += 15
-        reasons.append("價漲量增")
-    elif row["量價型態"] == "價跌量增":
+    if row["5K型態"] == "5K上影賣壓":
         score -= 15
-        reasons.append("價跌量增，賣壓較重")
-    elif row["量價型態"] == "價漲量縮":
-        score -= 5
-        reasons.append("價漲量縮，追高需小心")
-    elif row["量價型態"] == "價跌量縮":
-        score += 5
-        reasons.append("價跌量縮，可能是正常回檔")
+        reasons.append("近5K上影線偏多，上方賣壓較重")
 
-    # 費波轉折提醒
-    if row["費波提醒"] != "":
+    # ===== 健康回檔加分 =====
+    # 條件：趨勢還沒壞，MA5斜率修正，且沒有跌破MA20
+    if trend_ok and row["波段方向"] == "修正波" and close >= ma20:
+        score += 15
+        reasons.append("趨勢未壞但進入修正波，可能是回檔觀察點")
+
+    # 價跌量縮：可能是正常回檔
+    if row["量價型態"] == "價跌量縮" and close >= ma20:
+        score += 15
+        reasons.append("價跌量縮，可能是健康回檔")
+
+    # 下影承接：支撐有買盤
+    if row["5K後續狀態"] == "止跌觀察":
+        score += 15
+        reasons.append("5K出現下影承接，留意止跌")
+
+    # 修正波費波日數：3、5、8、13日
+    if "修正波第" in row["費波提醒"]:
+        score += 10
         reasons.append(row["費波提醒"])
 
+    # ===== 突破型進場 =====
+    # 突破可以加分，但如果已經過熱，不加太多
+    if row["5K後續狀態"] == "偏多轉強":
+        if ma5_gap <= 0.06 and ma20_gap <= 0.15:
+            score += 20
+            reasons.append("5K放量突破且乖離未過大")
+        else:
+            score += 5
+            reasons.append("5K放量突破，但乖離偏大，避免重倉追高")
+
+    # ===== 量價訊號 =====
+    if row["量價型態"] == "價漲量增":
+        if ma5_gap <= 0.05:
+            score += 15
+            reasons.append("價漲量增，且未明顯追高")
+        else:
+            score += 5
+            reasons.append("價漲量增，但位置偏高")
+
+    elif row["量價型態"] == "價漲量縮":
+        score -= 10
+        reasons.append("價漲量縮，上漲力道不足")
+
+    elif row["量價型態"] == "價跌量增":
+        score -= 25
+        reasons.append("價跌量增，賣壓放大")
+
+    # ===== 跌破支撐扣分 =====
+    if not pd.isna(row["20日支撐"]) and close < row["20日支撐"]:
+        score -= 30
+        reasons.append("跌破20日支撐，短線轉弱")
+
+    # ===== 接近支撐但未跌破，加觀察分 =====
+    if not pd.isna(row["20日支撐"]):
+        support_gap = (close - row["20日支撐"]) / row["20日支撐"]
+        if 0 <= support_gap <= 0.03 and close >= ma20:
+            score += 10
+            reasons.append("接近20日支撐且未跌破，可觀察承接")
+
+    # ===== 分數限制 =====
     score = max(0, min(100, score))
 
+    # ===== 評估文字 =====
     if score >= 80:
-        level = "強勢，可觀察進場"
-    elif score >= 60:
-        level = "偏多，等回檔或突破"
-    elif score >= 40:
-        level = "盤整，不急著進場"
-    elif score >= 20:
-        level = "偏弱，不建議進場"
+        level = "可觀察進場，但仍需分批"
+    elif score >= 65:
+        level = "偏適合觀察進場"
+    elif score >= 50:
+        level = "中性，等更明確訊號"
+    elif score >= 35:
+        level = "偏弱，不急著進場"
     else:
-        level = "轉弱，避開"
+        level = "不建議進場"
 
     if len(reasons) == 0:
         reason_text = "目前沒有明顯訊號"
@@ -452,7 +529,6 @@ def entry_score(row):
         reason_text = "、".join(reasons)
 
     return pd.Series([score, level, reason_text])
-
 
 # ===== 分析函式 =====
 def analyze_stock(df, cost):
