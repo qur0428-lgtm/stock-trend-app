@@ -3,6 +3,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except Exception:
+    AUTOREFRESH_AVAILABLE = False
+
+
 st.set_page_config(page_title="股票趨勢分析 APP", layout="wide")
 
 # ===== 股票名稱對照表 =====
@@ -36,7 +43,7 @@ STOCK_MAP = {
 }
 
 st.title("股票趨勢分析 APP")
-st.write("輸入台股名稱或代號，自動判斷均線、K線型態、5K結構、量價關係、推動波 / 修正波與進場評分。")
+st.write("輸入台股名稱或代號，自動判斷均線、K線型態、5K結構、量價關係、推動波 / 修正波、進場評分、獲利調節與停損風險。")
 
 # ===== 使用者輸入 =====
 stock_input = st.text_input("輸入股票名稱或代號，例如：信錦、台達電、1582、2308", value="信錦")
@@ -56,6 +63,18 @@ if use_cost:
     cost = st.number_input("輸入你的成本價", min_value=0.0, value=93.0, step=1.0)
 else:
     cost = 0.0
+
+st.markdown("---")
+realtime_mode = st.checkbox("開啟盤中即時監控（1分鐘資料）", value=True)
+
+if realtime_mode:
+    refresh_seconds = st.number_input("自動刷新秒數", min_value=30, max_value=300, value=60, step=30)
+    if AUTOREFRESH_AVAILABLE:
+        st_autorefresh(interval=int(refresh_seconds) * 1000, key="stock_realtime_refresh")
+    else:
+        st.warning("尚未安裝 streamlit-autorefresh，APP 不會自動刷新；請更新 requirements.txt 後重新部署。")
+else:
+    refresh_seconds = None
 
 # ===== 抓資料函式 =====
 def get_stock_data(code):
@@ -78,6 +97,81 @@ def get_stock_data(code):
         data.columns = data.columns.get_level_values(0)
 
     return data, ticker_used
+
+
+# ===== 盤中即時資料 =====
+def get_intraday_data(code):
+    """
+    抓當日 1 分 K 資料。
+    注意：yfinance 不是券商等級即時報價，可能延遲或非交易時間無資料。
+    """
+    ticker_tw = f"{code}.TW"
+    data = yf.download(ticker_tw, period="1d", interval="1m", progress=False)
+
+    if data.empty:
+        ticker_two = f"{code}.TWO"
+        data = yf.download(ticker_two, period="1d", interval="1m", progress=False)
+        ticker_used = ticker_two
+    else:
+        ticker_used = ticker_tw
+
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    data = data.dropna()
+    return data, ticker_used
+
+
+def analyze_intraday_monitor(intra_df):
+    """
+    盤中監控：回傳最新價、開盤價、最高、最低、漲跌幅、成交量、盤中均線與盤中狀態。
+    """
+    if intra_df is None or intra_df.empty:
+        return None
+
+    d = intra_df.copy().dropna()
+    if d.empty:
+        return None
+
+    latest = d.iloc[-1]
+    first = d.iloc[0]
+
+    latest_price = latest["Close"]
+    open_price = first["Open"]
+    high_price = d["High"].max()
+    low_price = d["Low"].min()
+    total_volume = d["Volume"].sum() / 1000
+
+    day_pct = (latest_price - open_price) / open_price * 100 if open_price != 0 else np.nan
+
+    d["MA5_intraday"] = d["Close"].rolling(5).mean()
+    d["MA20_intraday"] = d["Close"].rolling(20).mean()
+
+    latest_ma5 = d["MA5_intraday"].iloc[-1]
+    latest_ma20 = d["MA20_intraday"].iloc[-1]
+
+    if pd.isna(latest_ma20):
+        intraday_state = "資料不足"
+    elif latest_price > latest_ma5 > latest_ma20:
+        intraday_state = "盤中偏多"
+    elif latest_price < latest_ma20:
+        intraday_state = "盤中偏弱"
+    else:
+        intraday_state = "盤中震盪"
+
+    return {
+        "latest_price": latest_price,
+        "open_price": open_price,
+        "high_price": high_price,
+        "low_price": low_price,
+        "day_pct": day_pct,
+        "total_volume": total_volume,
+        "ma5": latest_ma5,
+        "ma20": latest_ma20,
+        "state": intraday_state,
+        "data": d,
+        "last_time": d.index[-1],
+    }
 
 
 # ===== 單根K線判斷 =====
@@ -382,32 +476,28 @@ def volume_analysis(row):
 def entry_score(row):
     """
     進場時機評分：
-    不是判斷股票強不強，而是判斷「現在這個位置適不適合進場」。
-
-    核心邏輯：
-    1. 趨勢不能太差
-    2. 避免追高
-    3. 偏好強勢股回檔、量縮整理、支撐承接、合理突破
+    同時考慮「趨勢型進場」與「止跌反彈觀察」。
+    因此下跌時不會全部直接變成不建議，而是會檢查是否有量縮、下影線、RSI跌深與支撐承接。
     """
 
     score = 50
     reasons = []
+    rebound_score = 0
+    rebound_reasons = []
 
     close = row["Close"]
-
     ma5 = row["MA5"]
     ma10 = row["MA10"]
     ma20 = row["MA20"]
 
-    # ===== 資料不足 =====
     if pd.isna(ma20):
         return pd.Series([0, "資料不足", "MA20資料不足，暫時不評估"])
 
-    # ===== 計算乖離 =====
     ma5_gap = (close - ma5) / ma5 if ma5 and not pd.isna(ma5) else 0
     ma20_gap = (close - ma20) / ma20 if ma20 and not pd.isna(ma20) else 0
+    rsi = row["RSI14"] if "RSI14" in row and not pd.isna(row["RSI14"]) else np.nan
 
-    # ===== 先判斷趨勢基礎 =====
+    # ===== 趨勢基礎 =====
     trend_ok = False
 
     if close > ma5 > ma10 > ma20:
@@ -426,7 +516,7 @@ def entry_score(row):
         score -= 25
         reasons.append("股價跌破MA20，趨勢偏弱")
 
-    # ===== 避免追高：漲太遠要扣分 =====
+    # ===== 避免追高 =====
     if ma5_gap > 0.06:
         score -= 20
         reasons.append("股價高於MA5超過6%，短線有追高風險")
@@ -441,7 +531,6 @@ def entry_score(row):
         score -= 10
         reasons.append("股價高於MA20超過10%，已有一定漲幅")
 
-    # ===== 5K過熱扣分 =====
     if row["5K後續狀態"] == "偏多但留意拉回":
         score -= 15
         reasons.append("5K急漲過熱，不適合追高")
@@ -451,28 +540,23 @@ def entry_score(row):
         reasons.append("近5K上影線偏多，上方賣壓較重")
 
     # ===== 健康回檔加分 =====
-    # 條件：趨勢還沒壞，MA5斜率修正，且沒有跌破MA20
     if trend_ok and row["波段方向"] == "修正波" and close >= ma20:
         score += 15
         reasons.append("趨勢未壞但進入修正波，可能是回檔觀察點")
 
-    # 價跌量縮：可能是正常回檔
     if row["量價型態"] == "價跌量縮" and close >= ma20:
         score += 15
         reasons.append("價跌量縮，可能是健康回檔")
 
-    # 下影承接：支撐有買盤
     if row["5K後續狀態"] == "止跌觀察":
         score += 15
         reasons.append("5K出現下影承接，留意止跌")
 
-    # 修正波費波日數：3、5、8、13日
     if "修正波第" in row["費波提醒"]:
         score += 10
         reasons.append(row["費波提醒"])
 
     # ===== 突破型進場 =====
-    # 突破可以加分，但如果已經過熱，不加太多
     if row["5K後續狀態"] == "偏多轉強":
         if ma5_gap <= 0.06 and ma20_gap <= 0.15:
             score += 20
@@ -489,11 +573,9 @@ def entry_score(row):
         else:
             score += 5
             reasons.append("價漲量增，但位置偏高")
-
     elif row["量價型態"] == "價漲量縮":
         score -= 10
         reasons.append("價漲量縮，上漲力道不足")
-
     elif row["量價型態"] == "價跌量增":
         score -= 25
         reasons.append("價跌量增，賣壓放大")
@@ -503,175 +585,246 @@ def entry_score(row):
         score -= 30
         reasons.append("跌破20日支撐，短線轉弱")
 
-    # ===== 接近支撐但未跌破，加觀察分 =====
     if not pd.isna(row["20日支撐"]):
         support_gap = (close - row["20日支撐"]) / row["20日支撐"]
         if 0 <= support_gap <= 0.03 and close >= ma20:
             score += 10
             reasons.append("接近20日支撐且未跌破，可觀察承接")
 
-    # ===== 分數限制 =====
-    score = max(0, min(100, score))
+    # ===== 止跌 / 反彈觀察分數 =====
+    if not pd.isna(rsi):
+        if rsi < 30:
+            rebound_score += 25
+            rebound_reasons.append("RSI低於30，短線跌深")
+        elif rsi < 40:
+            rebound_score += 15
+            rebound_reasons.append("RSI低於40，短線偏弱但可能接近反彈區")
 
-    # ===== 評估文字 =====
+    if row["量價型態"] == "價跌量縮":
+        rebound_score += 20
+        rebound_reasons.append("價跌量縮，賣壓有縮小跡象")
+
+    if "長下影" in row["K線型態"]:
+        rebound_score += 20
+        rebound_reasons.append("單日K線出現長下影，下方有承接")
+
+    if row["5K後續狀態"] == "止跌觀察":
+        rebound_score += 20
+        rebound_reasons.append("5K出現下影承接")
+
+    if not pd.isna(row["20日支撐"]):
+        support_gap = (close - row["20日支撐"]) / row["20日支撐"]
+        if 0 <= support_gap <= 0.03:
+            rebound_score += 15
+            rebound_reasons.append("接近20日支撐且尚未跌破")
+
+    if "修正波第" in row["費波提醒"]:
+        rebound_score += 10
+        rebound_reasons.append(row["費波提醒"])
+
+    score = max(0, min(100, score))
+    rebound_score = max(0, min(100, rebound_score))
+
     if score >= 80:
         level = "可觀察進場，但仍需分批"
     elif score >= 65:
         level = "偏適合觀察進場"
     elif score >= 50:
         level = "中性，等更明確訊號"
+    elif rebound_score >= 60:
+        level = "止跌觀察，可小部位留意"
+        reasons.extend(rebound_reasons)
+    elif rebound_score >= 40:
+        level = "偏弱，但有反彈觀察訊號"
+        reasons.extend(rebound_reasons)
     elif score >= 35:
-        level = "偏弱，不急著進場"
+        level = "偏弱，等待止跌"
     else:
         level = "不建議進場"
 
-    if len(reasons) == 0:
-        reason_text = "目前沒有明顯訊號"
-    else:
-        reason_text = "、".join(reasons)
-
+    reason_text = "、".join(reasons) if reasons else "目前沒有明顯訊號"
     return pd.Series([score, level, reason_text])
 
 
-# ===== 賣出 / 調節評分 =====
-def sell_score(row, cost=0):
+# ===== 獲利調節 / 停損風險評分 =====
+def holding_risk_scores(row, cost=0):
     """
-    賣出分數：
-    用來判斷「已有持股時，是否需要賣出、減碼或停損」。
-
-    分數越高，代表越需要注意賣壓或調節風險。
-    這不是預測一定會跌，而是幫助使用者辨識風險是否升高。
+    拆成兩個分數：
+    1. 獲利調節分數：有賺時，判斷是否過熱、賣壓、該不該先賣一部分。
+    2. 停損風險分數：虧損時，判斷是否跌破防守、是否需要減碼或停損。
     """
-    score = 0
-    reasons = []
-
     close = row["Close"]
     ma5 = row["MA5"]
     ma10 = row["MA10"]
     ma20 = row["MA20"]
 
+    profit_score = 0
+    stop_score = 0
+    profit_reasons = []
+    stop_reasons = []
+
     if pd.isna(ma20):
-        return pd.Series([0, "資料不足", "MA20資料不足，暫時不評估賣出風險"])
+        return pd.Series([0, "資料不足", "MA20資料不足", 0, "資料不足", "MA20資料不足", "資料不足"])
 
     ma5_gap = (close - ma5) / ma5 if ma5 and not pd.isna(ma5) else 0
     ma20_gap = (close - ma20) / ma20 if ma20 and not pd.isna(ma20) else 0
+    profit_pct = (close - cost) / cost * 100 if cost > 0 else np.nan
 
-    # ===== 技術面轉弱 =====
+    # ===== 獲利調節：只有有輸入成本且有獲利時才啟動 =====
+    if cost > 0 and profit_pct > 0:
+        if profit_pct >= 50:
+            profit_score += 25
+            profit_reasons.append("獲利超過50%，可考慮分批鎖利")
+        elif profit_pct >= 30:
+            profit_score += 18
+            profit_reasons.append("獲利超過30%，可留意分批調節")
+        elif profit_pct >= 15:
+            profit_score += 12
+            profit_reasons.append("獲利超過15%，可設定移動停利")
+        elif profit_pct >= 8:
+            profit_score += 6
+            profit_reasons.append("已有小幅獲利，可觀察是否轉弱")
+
+        if ma20_gap > 0.15:
+            profit_score += 20
+            profit_reasons.append("股價高於MA20超過15%，波段乖離偏大")
+        elif ma20_gap > 0.10:
+            profit_score += 10
+            profit_reasons.append("股價高於MA20超過10%，可留意調節")
+
+        if ma5_gap > 0.06:
+            profit_score += 15
+            profit_reasons.append("股價高於MA5超過6%，短線追高風險增加")
+
+        if row["5K後續狀態"] == "偏多但留意拉回":
+            profit_score += 15
+            profit_reasons.append("5K急漲過熱，留意獲利了結")
+
+        if "長上影" in row["K線型態"] or row["K線型態"] == "倒T線":
+            profit_score += 15
+            profit_reasons.append("K線出現上影賣壓")
+
+        if row["量價型態"] == "價漲量縮":
+            profit_score += 10
+            profit_reasons.append("價漲量縮，上漲動能不足")
+
+        if row["量價型態"] == "價跌量增":
+            profit_score += 15
+            profit_reasons.append("價跌量增，可能出現獲利了結賣壓")
+
+        if not pd.isna(ma5) and close < ma5:
+            profit_score += 10
+            profit_reasons.append("股價跌破MA5，短線動能降溫")
+
+        if not pd.isna(ma10) and close < ma10:
+            profit_score += 15
+            profit_reasons.append("股價跌破MA10，獲利部位可考慮保守")
+
+        if close > ma5 > ma10 > ma20 and ma5_gap <= 0.06 and ma20_gap <= 0.15:
+            profit_score -= 10
+            profit_reasons.append("均線多頭且乖離未過大，不急著調節")
+    else:
+        if cost <= 0:
+            profit_reasons.append("未輸入成本，無法判斷獲利調節")
+        else:
+            profit_reasons.append("目前沒有獲利，不屬於獲利調節情境")
+
+    # ===== 停損風險：主要針對虧損或技術破線 =====
+    if cost > 0 and profit_pct < 0:
+        if profit_pct <= -20:
+            stop_score += 30
+            stop_reasons.append("虧損超過20%，需重新檢查持股理由")
+        elif profit_pct <= -10:
+            stop_score += 22
+            stop_reasons.append("虧損超過10%，停損風險升高")
+        elif profit_pct <= -5:
+            stop_score += 12
+            stop_reasons.append("虧損超過5%，進入停損警戒")
+    elif cost <= 0:
+        stop_reasons.append("未輸入成本，停損風險僅能看技術面")
+
     if close < ma20:
-        score += 25
-        reasons.append("股價跌破MA20，波段轉弱風險提高")
-
-    if not pd.isna(ma5) and not pd.isna(ma10) and close < ma5 < ma10:
-        score += 15
-        reasons.append("股價低於MA5且MA5低於MA10，短線偏弱")
+        stop_score += 20
+        stop_reasons.append("股價跌破MA20，波段偏弱")
 
     if row["狀態"] == "轉弱":
-        score += 15
-        reasons.append("APP狀態判斷為轉弱")
+        stop_score += 15
+        stop_reasons.append("APP狀態判斷為轉弱")
 
     if row["波段方向"] == "修正波":
-        score += 10
-        reasons.append("MA5斜率向下，屬於修正波")
+        stop_score += 8
+        stop_reasons.append("MA5斜率向下，處於修正波")
 
-    # ===== 量價與K線賣壓 =====
     if row["量價型態"] == "價跌量增":
-        score += 25
-        reasons.append("價跌量增，賣壓放大")
-
-    elif row["量價型態"] == "價漲量縮":
-        score += 10
-        reasons.append("價漲量縮，上漲動能不足")
+        stop_score += 20
+        stop_reasons.append("價跌量增，賣壓放大")
 
     if row["5K型態"] == "5K放量跌破" or row["5K後續狀態"] == "偏空轉弱":
-        score += 25
-        reasons.append("5K放量跌破，短線賣壓轉強")
+        stop_score += 20
+        stop_reasons.append("5K放量跌破，短線賣壓轉強")
 
     if row["5K型態"] == "5K空方修正" or row["5K後續狀態"] == "偏空續弱":
-        score += 15
-        reasons.append("5K結構偏空，短線仍有修正壓力")
+        stop_score += 10
+        stop_reasons.append("5K結構偏空")
 
-    if row["5K後續狀態"] == "偏多但留意拉回":
-        score += 15
-        reasons.append("5K急漲過熱，可留意獲利了結")
-
-    if "長上影" in row["K線型態"] or row["K線型態"] == "倒T線":
-        score += 15
-        reasons.append("K線出現上影賣壓，短線追價意願不足")
-
-    # ===== 跌破支撐 =====
     if not pd.isna(row["20日支撐"]) and close < row["20日支撐"]:
-        score += 25
-        reasons.append("跌破20日支撐，防守位置失守")
+        stop_score += 20
+        stop_reasons.append("跌破20日支撐，防守位置失守")
 
-    # ===== 過熱調節 =====
-    if ma5_gap > 0.06:
-        score += 10
-        reasons.append("股價高於MA5超過6%，短線漲幅偏大")
-
-    if ma20_gap > 0.15:
-        score += 15
-        reasons.append("股價高於MA20超過15%，波段乖離偏大")
-    elif ma20_gap > 0.10:
-        score += 8
-        reasons.append("股價高於MA20超過10%，可留意分批調節")
-
-    # ===== 成本與獲利狀態 =====
-    if cost > 0:
-        profit_pct = (close - cost) / cost * 100
-
-        if profit_pct >= 50:
-            score += 15
-            reasons.append("獲利超過50%，可考慮鎖定部分利潤")
-        elif profit_pct >= 30:
-            score += 12
-            reasons.append("獲利超過30%，可考慮分批調節")
-        elif profit_pct >= 15:
-            score += 8
-            reasons.append("已有一定獲利，可設定移動停利")
-
-        if profit_pct <= -10:
-            score += 30
-            reasons.append("虧損超過10%，需檢查是否停損")
-        elif profit_pct <= -5:
-            score += 20
-            reasons.append("虧損超過5%，停損警戒")
-    else:
-        reasons.append("未輸入成本，賣出分數僅依技術面判斷")
-
-    # ===== 降低賣出分數的條件：趨勢仍強或有承接 =====
-    if close > ma5 > ma10 > ma20 and ma5_gap <= 0.06 and ma20_gap <= 0.15:
-        score -= 15
-        reasons.append("均線多頭排列且乖離未過大，暫不急著賣")
-
-    if row["量價型態"] == "價跌量縮" and close >= ma20:
-        score -= 10
-        reasons.append("價跌量縮且仍守在MA20上方，可能是健康回檔")
+    # 跌深但有承接時，避免把「殺低」和「停損」混在一起
+    rsi = row["RSI14"] if "RSI14" in row and not pd.isna(row["RSI14"]) else np.nan
+    if not pd.isna(rsi) and rsi < 30:
+        stop_score -= 8
+        stop_reasons.append("RSI低於30，已偏跌深，避免情緒性殺低")
 
     if "長下影" in row["K線型態"] or row["5K後續狀態"] == "止跌觀察":
-        score -= 10
-        reasons.append("出現下影承接，先觀察是否止跌")
+        stop_score -= 10
+        stop_reasons.append("出現下影承接，可觀察是否止跌")
 
-    if not pd.isna(row["20日支撐"]):
-        support_gap = (close - row["20日支撐"]) / row["20日支撐"]
-        if 0 <= support_gap <= 0.03 and close >= ma20:
-            score -= 8
-            reasons.append("接近20日支撐且未跌破，暫可觀察承接")
+    profit_score = max(0, min(100, profit_score))
+    stop_score = max(0, min(100, stop_score))
 
-    score = max(0, min(100, score))
-
-    if score >= 80:
-        level = "賣出風險高，可考慮減碼或停損"
-    elif score >= 65:
-        level = "偏高，可考慮部分調節"
-    elif score >= 50:
-        level = "中等，觀察是否站回均線"
-    elif score >= 35:
-        level = "偏低，暫不急著賣"
+    if profit_score >= 80:
+        profit_level = "獲利調節訊號高，可考慮分批賣出"
+    elif profit_score >= 60:
+        profit_level = "偏高，可考慮先賣一部分"
+    elif profit_score >= 40:
+        profit_level = "中等，設定移動停利"
+    elif profit_score > 0:
+        profit_level = "偏低，續抱觀察"
     else:
-        level = "續抱觀察"
+        profit_level = "無獲利調節訊號"
 
-    reason_text = "、".join(reasons) if reasons else "目前沒有明顯賣出訊號"
-    return pd.Series([score, level, reason_text])
+    if stop_score >= 80:
+        stop_level = "停損風險高，需檢查是否減碼"
+    elif stop_score >= 60:
+        stop_level = "停損風險偏高，等待反彈或設停損線"
+    elif stop_score >= 40:
+        stop_level = "中等風險，觀察能否站回均線"
+    elif stop_score > 0:
+        stop_level = "風險偏低，續觀察"
+    else:
+        stop_level = "無明顯停損風險"
+
+    if profit_score >= 60:
+        holding_advice = "有獲利且調節訊號偏高，較適合分批賣出，不建議一次全賣。"
+    elif stop_score >= 60:
+        holding_advice = "這是停損風險，不是獲利賣出訊號；可等反彈或設定明確停損線。"
+    elif profit_score >= 40:
+        holding_advice = "有獲利但未明顯過熱，可續抱並設定移動停利。"
+    elif stop_score >= 40:
+        holding_advice = "技術面偏弱，先觀察能否站回MA5或MA10。"
+    else:
+        holding_advice = "目前沒有強烈調節或停損訊號，續抱觀察。"
+
+    profit_reason_text = "、".join(profit_reasons) if profit_reasons else "目前沒有獲利調節訊號"
+    stop_reason_text = "、".join(stop_reasons) if stop_reasons else "目前沒有停損風險訊號"
+
+    return pd.Series([
+        profit_score, profit_level, profit_reason_text,
+        stop_score, stop_level, stop_reason_text,
+        holding_advice
+    ])
 
 # ===== 分析函式 =====
 def analyze_stock(df, cost):
@@ -688,6 +841,15 @@ def analyze_stock(df, cost):
     df["MA5"] = df["Close"].rolling(5).mean()
     df["MA10"] = df["Close"].rolling(10).mean()
     df["MA20"] = df["Close"].rolling(20).mean()
+
+    # RSI14：輔助判斷跌深反彈或短線過熱
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI14"] = 100 - (100 / (1 + rs))
 
     # 判斷單根K線型態
     df[["K線型態", "K線解讀"]] = df.apply(classify_kbar, axis=1)
@@ -792,8 +954,12 @@ def analyze_stock(df, cost):
     # 進場評估
     df[["進場分數", "進場評估", "評估原因"]] = df.apply(entry_score, axis=1)
 
-    # 賣出 / 調節評估
-    df[["賣出分數", "賣出評估", "賣出原因"]] = df.apply(lambda row: sell_score(row, cost), axis=1)
+    # 獲利調節 / 停損風險評估
+    df[[
+        "獲利調節分數", "獲利調節評估", "獲利調節原因",
+        "停損風險分數", "停損風險評估", "停損風險原因",
+        "持股建議"
+    ]] = df.apply(lambda row: holding_risk_scores(row, cost), axis=1)
 
     return df
 
@@ -813,40 +979,57 @@ if stock_code:
             else:
                 latest = result.iloc[-1]
 
-                st.subheader(f"股票：{stock_name} / {stock_code}，資料來源代號：{ticker_used}")
+                monitor = None
+                intra_ticker = None
+                if realtime_mode:
+                    intra_df, intra_ticker = get_intraday_data(stock_code)
+                    monitor = analyze_intraday_monitor(intra_df)
 
-                tab1, tab2, tab3, tab4 = st.tabs(["總覽", "K線與均線", "5K與量價", "資料表"])
+                display_price = monitor["latest_price"] if monitor is not None else latest["Close"]
+                display_pnl = (display_price - cost) / cost * 100 if cost > 0 else np.nan
+
+                st.subheader(f"股票：{stock_name} / {stock_code}，日K資料來源代號：{ticker_used}")
+
+                tab1, tab2, tab3, tab4, tab5 = st.tabs(["總覽", "K線與均線", "5K與量價", "資料表", "即時監控"])
 
                 with tab1:
                     st.markdown("## 總覽")
 
                     col1, col2, col3, col4 = st.columns(4)
 
-                    col1.metric("最新收盤價", f"{latest['Close']:.2f}")
-                    col2.metric("狀態", latest["狀態"])
+                    price_label = "盤中即時價" if monitor is not None else "最新收盤價"
+                    col1.metric(price_label, f"{display_price:.2f}")
+                    col2.metric("日K狀態", latest["狀態"])
                     col3.metric("進場分數", f"{latest['進場分數']:.0f}")
                     col4.metric("進場評估", latest["進場評估"])
 
                     col5, col6, col7, col8 = st.columns(4)
 
-                    col5.metric("MA5", f"{latest['MA5']:.2f}" if not pd.isna(latest["MA5"]) else "資料不足")
-                    col6.metric("MA10", f"{latest['MA10']:.2f}" if not pd.isna(latest["MA10"]) else "資料不足")
-                    col7.metric("MA20", f"{latest['MA20']:.2f}" if not pd.isna(latest["MA20"]) else "資料不足")
+                    col5.metric("MA5（日K）", f"{latest['MA5']:.2f}" if not pd.isna(latest["MA5"]) else "資料不足")
+                    col6.metric("MA10（日K）", f"{latest['MA10']:.2f}" if not pd.isna(latest["MA10"]) else "資料不足")
+                    col7.metric("MA20（日K）", f"{latest['MA20']:.2f}" if not pd.isna(latest["MA20"]) else "資料不足")
 
                     if cost > 0:
-                        col8.metric("損益率", f"{latest['損益率']:.2f}%")
+                        col8.metric("即時/最新損益率", f"{display_pnl:.2f}%")
                     else:
                         col8.metric("損益率", "未輸入成本")
 
-                    col9, col10 = st.columns(2)
-                    col9.metric("賣出分數", f"{latest['賣出分數']:.0f}")
-                    col10.metric("賣出評估", latest["賣出評估"])
+                    col9, col10, col11 = st.columns(3)
+                    col9.metric("獲利調節分數", f"{latest['獲利調節分數']:.0f}")
+                    col10.metric("停損風險分數", f"{latest['停損風險分數']:.0f}")
+                    col11.metric("RSI14", f"{latest['RSI14']:.2f}" if not pd.isna(latest["RSI14"]) else "資料不足")
 
                     st.markdown("### 進場評估原因")
                     st.info(latest["評估原因"])
 
-                    st.markdown("### 賣出 / 調節評估原因")
-                    st.warning(latest["賣出原因"])
+                    st.markdown("### 持股建議")
+                    st.warning(latest["持股建議"])
+
+                    st.markdown("### 獲利調節原因")
+                    st.info(latest["獲利調節原因"])
+
+                    st.markdown("### 停損風險原因")
+                    st.error(latest["停損風險原因"])
 
                     st.markdown("### 持股操作提醒")
                     st.write(latest["操作提醒"])
@@ -898,17 +1081,45 @@ if stock_code:
                         "Open", "High", "Low", "Close",
                         "Volume", "成交量_張", "MV5", "MV20",
                         "K線型態", "K線解讀",
-                        "MA5", "MA10", "MA20",
+                        "MA5", "MA10", "MA20", "RSI14",
                         "狀態", "波段方向", "波段天數", "費波提醒",
                         "5K型態", "5K後續狀態", "5K解讀",
                         "量價型態", "量價解讀",
                         "進場分數", "進場評估", "評估原因",
-                        "賣出分數", "賣出評估", "賣出原因",
+                        "獲利調節分數", "獲利調節評估", "獲利調節原因",
+                        "停損風險分數", "停損風險評估", "停損風險原因", "持股建議",
                         "損益率", "操作提醒"
                     ]
 
                     existing_cols = [col for col in show_cols if col in result.columns]
                     st.dataframe(result[existing_cols].tail(30), use_container_width=True)
+
+                with tab5:
+                    st.markdown("## 即時監控")
+                    st.caption("此功能使用 yfinance 1分鐘盤中資料，可能延遲；適合監控，不適合當成券商即時下單報價。")
+
+                    if not realtime_mode:
+                        st.info("尚未開啟盤中即時監控。請在上方勾選「開啟盤中即時監控（1分鐘資料）」。")
+                    elif monitor is None:
+                        st.error("抓不到盤中資料，可能是非交易時間、資料源延遲，或 yfinance 暫時無資料。")
+                    else:
+                        st.caption(f"盤中資料來源代號：{intra_ticker}；最後資料時間：{monitor['last_time']}；每 {refresh_seconds} 秒刷新一次")
+
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("盤中最新價", f"{monitor['latest_price']:.2f}")
+                        c2.metric("今日漲跌幅", f"{monitor['day_pct']:.2f}%")
+                        c3.metric("盤中狀態", monitor["state"])
+                        c4.metric("成交量", f"{monitor['total_volume']:.0f} 張")
+
+                        c5, c6, c7, c8 = st.columns(4)
+                        c5.metric("開盤價", f"{monitor['open_price']:.2f}")
+                        c6.metric("最高價", f"{monitor['high_price']:.2f}")
+                        c7.metric("最低價", f"{monitor['low_price']:.2f}")
+                        c8.metric("盤中MA20", f"{monitor['ma20']:.2f}" if not pd.isna(monitor["ma20"]) else "資料不足")
+
+                        st.markdown("### 盤中價格走勢")
+                        chart = monitor["data"][["Close", "MA5_intraday", "MA20_intraday"]].dropna()
+                        st.line_chart(chart, use_container_width=True)
 
     except Exception as e:
         st.error("程式執行時發生錯誤")
