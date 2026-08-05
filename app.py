@@ -77,24 +77,141 @@ else:
     refresh_seconds = None
 
 # ===== 抓資料函式 =====
-def get_stock_data(code):
+def _clean_yfinance_data(data):
+    """整理 yfinance 回傳欄位，避免 MultiIndex 造成後面計算錯誤。"""
+    if data is None:
+        return pd.DataFrame()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    return data.copy()
+
+
+def _download_stock_by_code(code, period="1y", interval="1d"):
     """
-    台灣上市股票通常是 .TW
-    台灣上櫃股票通常是 .TWO
-    先抓 .TW，抓不到再抓 .TWO
+    先抓 .TW，抓不到再抓 .TWO。
+    回傳 data, ticker_used。
     """
     ticker_tw = f"{code}.TW"
-    data = yf.download(ticker_tw, period="1y", interval="1d", progress=False)
+    data = yf.download(ticker_tw, period=period, interval=interval, progress=False)
+    data = _clean_yfinance_data(data)
 
     if data.empty:
         ticker_two = f"{code}.TWO"
-        data = yf.download(ticker_two, period="1y", interval="1d", progress=False)
+        data = yf.download(ticker_two, period=period, interval=interval, progress=False)
+        data = _clean_yfinance_data(data)
         ticker_used = ticker_two
     else:
         ticker_used = ticker_tw
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    return data, ticker_used
+
+
+def _make_latest_daily_bar_from_intraday(intra_df):
+    """
+    將最近一個交易日的 1 分 K 合成一根日 K。
+    這可以補上 yfinance 日K尚未更新的最新交易日。
+    """
+    if intra_df is None or intra_df.empty:
+        return None, None
+
+    d = _clean_yfinance_data(intra_df).dropna()
+    if d.empty:
+        return None, None
+
+    # 只取 intraday 資料中「最後一個交易日」
+    latest_date = d.index[-1].date()
+    d_latest = d[d.index.date == latest_date].copy()
+
+    if d_latest.empty:
+        return None, None
+
+    bar = {
+        "Open": d_latest["Open"].iloc[0],
+        "High": d_latest["High"].max(),
+        "Low": d_latest["Low"].min(),
+        "Close": d_latest["Close"].iloc[-1],
+        "Volume": d_latest["Volume"].sum(),
+    }
+
+    # 如果日K有 Adj Close 欄位，也補上，避免 dropna 時最新列被刪掉
+    if "Adj Close" in d_latest.columns:
+        bar["Adj Close"] = d_latest["Adj Close"].iloc[-1]
+
+    return pd.Timestamp(latest_date), bar
+
+
+def _append_or_replace_latest_intraday_bar(daily_df, ticker_used):
+    """
+    用最近 1 分 K 合成的日K，補進日K資料。
+    若日K已經有同一天，則用盤中合成資料覆蓋；
+    若日K缺最新交易日，則新增一列。
+    """
+    if daily_df is None or daily_df.empty:
+        return daily_df, False
+
+    daily = _clean_yfinance_data(daily_df).copy()
+    daily = daily.sort_index()
+
+    intra = yf.download(ticker_used, period="5d", interval="1m", progress=False)
+    intra = _clean_yfinance_data(intra)
+
+    latest_index, latest_bar = _make_latest_daily_bar_from_intraday(intra)
+    if latest_index is None or latest_bar is None:
+        return daily, False
+
+    last_daily_date = daily.index[-1].date()
+    latest_intraday_date = latest_index.date()
+
+    # 只在 intraday 日期 >= 日K最後日期時處理
+    if latest_intraday_date < last_daily_date:
+        return daily, False
+
+    # 建立資料來源欄位，方便你在資料表確認最新一列是日K或盤中合成
+    if "資料來源" not in daily.columns:
+        daily["資料來源"] = "日K"
+
+    # 確保新列欄位完整
+    new_row = {}
+    for col in daily.columns:
+        if col in latest_bar:
+            new_row[col] = latest_bar[col]
+        elif col == "資料來源":
+            new_row[col] = "1分K合成日K"
+        elif col == "Adj Close" and "Close" in latest_bar:
+            new_row[col] = latest_bar["Close"]
+        else:
+            new_row[col] = np.nan
+
+    # 如果同一天已存在，覆蓋；如果日K還沒更新到最新交易日，新增
+    same_day_mask = [idx.date() == latest_intraday_date for idx in daily.index]
+    if any(same_day_mask):
+        replace_idx = daily.index[same_day_mask.index(True)]
+        for col, val in new_row.items():
+            daily.loc[replace_idx, col] = val
+    else:
+        daily.loc[latest_index, list(new_row.keys())] = list(new_row.values())
+        daily = daily.sort_index()
+
+    return daily, True
+
+
+def get_stock_data(code):
+    """
+    抓日K資料，並用最近 1 分 K 合成最新交易日的日K。
+
+    為什麼要這樣做：
+    yfinance 的日K有時候收盤後不會馬上更新，
+    但 1 分 K通常比較快有最新交易日資料，
+    所以這裡會把最近一個交易日的 1 分 K 合成一根日K補進資料表。
+    """
+    data, ticker_used = _download_stock_by_code(code, period="1y", interval="1d")
+
+    if data.empty:
+        return data, ticker_used
+
+    data, patched = _append_or_replace_latest_intraday_bar(data, ticker_used)
 
     return data, ticker_used
 
@@ -102,34 +219,29 @@ def get_stock_data(code):
 # ===== 盤中即時資料 =====
 def get_intraday_data(code):
     """
-    抓當日 1 分 K 資料。
-    注意：yfinance 不是券商等級即時報價，可能延遲或非交易時間無資料。
+    抓最近 5 個交易日的 1 分 K 資料。
+    注意：yfinance 不是券商等級即時報價，可能延遲。
     """
-    ticker_tw = f"{code}.TW"
-    data = yf.download(ticker_tw, period="1d", interval="1m", progress=False)
-
-    if data.empty:
-        ticker_two = f"{code}.TWO"
-        data = yf.download(ticker_two, period="1d", interval="1m", progress=False)
-        ticker_used = ticker_two
-    else:
-        ticker_used = ticker_tw
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
+    data, ticker_used = _download_stock_by_code(code, period="5d", interval="1m")
     data = data.dropna()
     return data, ticker_used
 
 
 def analyze_intraday_monitor(intra_df):
     """
-    盤中監控：回傳最新價、開盤價、最高、最低、漲跌幅、成交量、盤中均線與盤中狀態。
+    盤中監控：只分析最近一個交易日，回傳最新價、開盤價、最高、最低、漲跌幅、成交量、盤中均線與盤中狀態。
     """
     if intra_df is None or intra_df.empty:
         return None
 
-    d = intra_df.copy().dropna()
+    d = _clean_yfinance_data(intra_df).dropna()
+    if d.empty:
+        return None
+
+    # period=5d 時，只取最後一個交易日，避免把多天成交量加在一起
+    latest_date = d.index[-1].date()
+    d = d[d.index.date == latest_date].copy()
+
     if d.empty:
         return None
 
@@ -477,7 +589,11 @@ def entry_score(row):
     """
     進場時機評分：
     同時考慮「趨勢型進場」與「止跌反彈觀察」。
-    因此下跌時不會全部直接變成不建議，而是會檢查是否有量縮、下影線、RSI跌深與支撐承接。
+
+    這版加入緩衝邏輯：
+    1. 小幅跌破 MA20 不直接重扣分。
+    2. 價跌量增依照是否跌破 MA20 分級扣分。
+    3. 小幅跌破支撐先列為觀察，不直接打到最低分。
     """
 
     score = 50
@@ -497,24 +613,32 @@ def entry_score(row):
     ma20_gap = (close - ma20) / ma20 if ma20 and not pd.isna(ma20) else 0
     rsi = row["RSI14"] if "RSI14" in row and not pd.isna(row["RSI14"]) else np.nan
 
-    # ===== 趨勢基礎 =====
+    # ===== 趨勢基礎：加入小幅跌破緩衝 =====
     trend_ok = False
+    soft_trend_ok = False
 
     if close > ma5 > ma10 > ma20:
         score += 20
         trend_ok = True
+        soft_trend_ok = True
         reasons.append("均線多頭排列")
     elif close > ma20 and ma5 > ma10:
         score += 10
         trend_ok = True
+        soft_trend_ok = True
         reasons.append("股價站上MA20，短線均線偏多")
     elif close > ma20:
         score += 5
         trend_ok = True
+        soft_trend_ok = True
         reasons.append("股價仍站上MA20")
+    elif ma20_gap > -0.02:
+        score -= 5
+        soft_trend_ok = True
+        reasons.append("股價小幅跌破MA20（2%內），先觀察是否為假跌破")
     else:
-        score -= 25
-        reasons.append("股價跌破MA20，趨勢偏弱")
+        score -= 20
+        reasons.append("股價明顯跌破MA20，趨勢偏弱")
 
     # ===== 避免追高 =====
     if ma5_gap > 0.06:
@@ -540,11 +664,11 @@ def entry_score(row):
         reasons.append("近5K上影線偏多，上方賣壓較重")
 
     # ===== 健康回檔加分 =====
-    if trend_ok and row["波段方向"] == "修正波" and close >= ma20:
-        score += 15
-        reasons.append("趨勢未壞但進入修正波，可能是回檔觀察點")
+    if soft_trend_ok and row["波段方向"] == "修正波":
+        score += 12
+        reasons.append("趨勢尚未完全轉弱但進入修正波，列為回檔觀察")
 
-    if row["量價型態"] == "價跌量縮" and close >= ma20:
+    if row["量價型態"] == "價跌量縮" and soft_trend_ok:
         score += 15
         reasons.append("價跌量縮，可能是健康回檔")
 
@@ -565,7 +689,7 @@ def entry_score(row):
             score += 5
             reasons.append("5K放量突破，但乖離偏大，避免重倉追高")
 
-    # ===== 量價訊號 =====
+    # ===== 量價訊號：價跌量增分級扣分 =====
     if row["量價型態"] == "價漲量增":
         if ma5_gap <= 0.05:
             score += 15
@@ -577,19 +701,33 @@ def entry_score(row):
         score -= 10
         reasons.append("價漲量縮，上漲力道不足")
     elif row["量價型態"] == "價跌量增":
-        score -= 25
-        reasons.append("價跌量增，賣壓放大")
+        if close < ma20 and ma20_gap <= -0.02:
+            score -= 20
+            reasons.append("價跌量增且明顯跌破MA20，賣壓放大")
+        elif close < ma20:
+            score -= 10
+            reasons.append("價跌量增但僅小幅跌破MA20，先觀察是否止跌")
+        else:
+            score -= 10
+            reasons.append("價跌量增，但尚未跌破MA20，先觀察")
 
-    # ===== 跌破支撐扣分 =====
-    if not pd.isna(row["20日支撐"]) and close < row["20日支撐"]:
-        score -= 30
-        reasons.append("跌破20日支撐，短線轉弱")
-
+    # ===== 跌破支撐扣分：小幅跌破先觀察 =====
     if not pd.isna(row["20日支撐"]):
         support_gap = (close - row["20日支撐"]) / row["20日支撐"]
-        if 0 <= support_gap <= 0.03 and close >= ma20:
+
+        if support_gap < -0.02:
+            score -= 20
+            reasons.append("明顯跌破20日支撐，短線轉弱")
+        elif support_gap < 0:
+            score -= 10
+            rebound_score += 5
+            rebound_reasons.append("小幅跌破20日支撐，觀察是否快速站回")
+            reasons.append("小幅跌破20日支撐，先觀察是否為假跌破")
+        elif support_gap <= 0.03:
             score += 10
+            rebound_score += 15
             reasons.append("接近20日支撐且未跌破，可觀察承接")
+            rebound_reasons.append("接近20日支撐且尚未跌破")
 
     # ===== 止跌 / 反彈觀察分數 =====
     if not pd.isna(rsi):
@@ -611,12 +749,6 @@ def entry_score(row):
     if row["5K後續狀態"] == "止跌觀察":
         rebound_score += 20
         rebound_reasons.append("5K出現下影承接")
-
-    if not pd.isna(row["20日支撐"]):
-        support_gap = (close - row["20日支撐"]) / row["20日支撐"]
-        if 0 <= support_gap <= 0.03:
-            rebound_score += 15
-            rebound_reasons.append("接近20日支撐且尚未跌破")
 
     if "修正波第" in row["費波提醒"]:
         rebound_score += 10
@@ -644,6 +776,49 @@ def entry_score(row):
 
     reason_text = "、".join(reasons) if reasons else "目前沒有明顯訊號"
     return pd.Series([score, level, reason_text])
+
+
+def score_to_entry_level(score, reason_text=""):
+    """
+    依照平滑後分數重新產生進場評估文字。
+    """
+    if score >= 80:
+        return "可觀察進場，但仍需分批"
+    elif score >= 65:
+        return "偏適合觀察進場"
+    elif score >= 50:
+        return "中性，等更明確訊號"
+    elif "反彈觀察" in str(reason_text) or "止跌" in str(reason_text) or "長下影" in str(reason_text):
+        return "偏弱，但有反彈觀察訊號"
+    elif score >= 35:
+        return "偏弱，等待止跌"
+    else:
+        return "不建議進場"
+
+
+def smooth_entry_scores(raw_scores, max_step=20):
+    """
+    避免進場分數因為單日小幅破線而暴衝暴跌。
+    每一天分數最多只比前一天變動 max_step 分。
+    """
+    smoothed = []
+
+    for value in raw_scores:
+        if pd.isna(value):
+            smoothed.append(value)
+            continue
+
+        value = float(value)
+        if not smoothed or pd.isna(smoothed[-1]):
+            smoothed.append(value)
+            continue
+
+        prev = float(smoothed[-1])
+        upper = prev + max_step
+        lower = prev - max_step
+        smoothed.append(max(lower, min(upper, value)))
+
+    return smoothed
 
 
 # ===== 獲利調節 / 停損風險評分 =====
@@ -954,6 +1129,15 @@ def analyze_stock(df, cost):
     # 進場評估
     df[["進場分數", "進場評估", "評估原因"]] = df.apply(entry_score, axis=1)
 
+    # 保留原始分數，再加入平滑緩衝，避免分數一天內大幅跳動
+    df["原始進場分數"] = df["進場分數"]
+    df["進場分數"] = smooth_entry_scores(df["原始進場分數"], max_step=20)
+    df["進場評估"] = df.apply(lambda row: score_to_entry_level(row["進場分數"], row["評估原因"]), axis=1)
+    df["分數緩衝說明"] = df.apply(
+        lambda row: "已啟用每日最大20分變動緩衝" if abs(row["進場分數"] - row["原始進場分數"]) > 0.01 else "未觸發分數緩衝",
+        axis=1
+    )
+
     # 獲利調節 / 停損風險評估
     df[[
         "獲利調節分數", "獲利調節評估", "獲利調節原因",
@@ -989,6 +1173,7 @@ if stock_code:
                 display_pnl = (display_price - cost) / cost * 100 if cost > 0 else np.nan
 
                 st.subheader(f"股票：{stock_name} / {stock_code}，日K資料來源代號：{ticker_used}")
+                st.caption(f"日K最後資料日期：{latest.name.date()}｜最新列資料來源：{latest['資料來源'] if '資料來源' in result.columns else '日K'}")
 
                 tab1, tab2, tab3, tab4, tab5 = st.tabs(["總覽", "K線與均線", "5K與量價", "資料表", "即時監控"])
 
@@ -1021,6 +1206,7 @@ if stock_code:
 
                     st.markdown("### 進場評估原因")
                     st.info(latest["評估原因"])
+                    st.caption(f"原始進場分數：{latest['原始進場分數']:.0f}｜{latest['分數緩衝說明']}")
 
                     st.markdown("### 持股建議")
                     st.warning(latest["持股建議"])
@@ -1078,14 +1264,14 @@ if stock_code:
                     st.markdown("## 最近 30 筆資料")
 
                     show_cols = [
-                        "Open", "High", "Low", "Close",
+                        "Open", "High", "Low", "Close", "資料來源",
                         "Volume", "成交量_張", "MV5", "MV20",
                         "K線型態", "K線解讀",
                         "MA5", "MA10", "MA20", "RSI14",
                         "狀態", "波段方向", "波段天數", "費波提醒",
                         "5K型態", "5K後續狀態", "5K解讀",
                         "量價型態", "量價解讀",
-                        "進場分數", "進場評估", "評估原因",
+                        "原始進場分數", "進場分數", "進場評估", "分數緩衝說明", "評估原因",
                         "獲利調節分數", "獲利調節評估", "獲利調節原因",
                         "停損風險分數", "停損風險評估", "停損風險原因", "持股建議",
                         "損益率", "操作提醒"
