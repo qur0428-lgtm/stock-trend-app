@@ -757,12 +757,27 @@ def entry_score(row):
     score = max(0, min(100, score))
     rebound_score = max(0, min(100, rebound_score))
 
+    # ===== 判斷是否為過熱，不是偏弱 =====
+    is_overheated = False
+
+    if ma5_gap > 0.035 or ma20_gap > 0.10:
+        is_overheated = True
+
+    if row["5K後續狀態"] == "偏多但留意拉回":
+        is_overheated = True
+
+    if "RSI14" in row and not pd.isna(row["RSI14"]) and row["RSI14"] >= 70:
+        is_overheated = True
+
+    # ===== 評估文字 =====
     if score >= 80:
         level = "可觀察進場，但仍需分批"
     elif score >= 65:
         level = "偏適合觀察進場"
     elif score >= 50:
         level = "中性，等更明確訊號"
+    elif is_overheated and trend_ok:
+        level = "偏多但過熱，等待回檔"
     elif rebound_score >= 60:
         level = "止跌觀察，可小部位留意"
         reasons.extend(rebound_reasons)
